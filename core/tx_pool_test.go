@@ -55,7 +55,7 @@ type testBlockChain struct {
 func (bc *testBlockChain) CurrentBlock() *types.Block {
 	return types.NewBlock(&types.Header{
 		GasLimit: bc.gasLimit,
-	}, nil, nil, nil, new(trie.Trie))
+	}, nil, nil, nil, trie.NewStackTrie(nil))
 }
 
 func (bc *testBlockChain) GetBlock(hash common.Hash, number uint64) *types.Block {
@@ -2050,55 +2050,6 @@ func BenchmarkInsertRemoteWithAllLocals(b *testing.B) {
 			pool.AddRemotes([]*types.Transaction{remotes[i]})
 		}
 		pool.Stop()
-	}
-}
-
-// MEV Bundle tests
-func TestBundles(t *testing.T) {
-	pool := TxPool{}
-	var empty types.Transactions
-	empty = append(empty, &types.Transaction{})
-
-	pool.AddMevBundle(empty, big.NewInt(4), 0, 0)
-	pool.AddMevBundle(empty, big.NewInt(5), 0, 0)
-	pool.AddMevBundle(empty, big.NewInt(6), 0, 0)
-	pool.AddMevBundle(empty, big.NewInt(9), 0, 0)
-	pool.AddMevBundle(empty, big.NewInt(9), 0, 0)
-	pool.AddMevBundle(empty, big.NewInt(12), 0, 0)
-	pool.AddMevBundle(empty, big.NewInt(15), 0, 0)
-
-	type bundleTestData struct {
-		block             int64
-		testTimestamp     uint64
-		expectedRes       int
-		expectedRemaining int
-		action            func()
-	}
-
-	testData := []bundleTestData{
-		// prunes outdated ones, too early for the rest
-		{8, 0, 0, 4, nil},
-		// 2 at 9, nothing to prune
-		{9, 0, 2, 4, nil},
-		// adds a bundle at 10 which has a min/max timestamp that's outdated
-		// the only bundles remaining are 12 and 15
-		{10, 8, 0, 2, func() { pool.AddMevBundle(empty, big.NewInt(10), 5, 7) }},
-		// nothing returned, remaining is the same
-		{11, 0, 0, 2, nil},
-		// one bundle at 12
-		{12, 0, 1, 2, nil},
-		// no bundle, 12 got pruned
-		{13, 0, 0, 1, nil},
-		{14, 0, 0, 1, nil},
-		{15, 0, 1, 1, nil},
-		{16, 0, 0, 0, nil},
-	}
-
-	for _, v := range testData {
-		if v.action != nil {
-			v.action()
-		}
-		checkBundles(t, &pool, v.block, v.testTimestamp, v.expectedRes, v.expectedRemaining)
 	}
 }
 

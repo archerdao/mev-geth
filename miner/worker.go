@@ -336,6 +336,9 @@ func (w *worker) isRunning() bool {
 // close terminates all background threads maintained by the worker.
 // Note the worker does not support being closed multiple times.
 func (w *worker) close() {
+	if w.current != nil && w.current.state != nil {
+		w.current.state.StopPrefetcher()
+	}
 	atomic.StoreInt32(&w.running, 0)
 	close(w.exitCh)
 }
@@ -567,8 +570,8 @@ func (w *worker) taskLoop() {
 		stopCh chan struct{}
 		prev   common.Hash
 
-		prevNumber *big.Int
-		prevProfit *big.Int
+		prevParentHash common.Hash
+		prevProfit     *big.Int
 	)
 
 	// interrupt aborts the in-flight sealing task.
@@ -590,17 +593,19 @@ func (w *worker) taskLoop() {
 				continue
 			}
 
+			taskParentHash := task.block.Header().ParentHash
 			// reject new tasks which don't profit
-			if prevNumber != nil && prevProfit != nil &&
-				task.block.Number().Cmp(prevNumber) == 0 && task.profit.Cmp(prevProfit) < 0 {
+			if taskParentHash == prevParentHash &&
+				prevProfit != nil && task.profit.Cmp(prevProfit) < 0 {
 				continue
 			}
-			prevNumber, prevProfit = task.block.Number(), task.profit
+			prevParentHash = taskParentHash
+			prevProfit = task.profit
 
 			// Interrupt previous sealing operation
 			interrupt()
 			stopCh, prev = make(chan struct{}), sealHash
-			log.Info("Proposed miner block", "blockNumber", prevNumber, "profit", prevProfit, "isFlashbots", task.isFlashbots, "sealhash", sealHash)
+			log.Info("Proposed miner block", "blockNumber", task.block.Number(), "profit", prevProfit, "isFlashbots", task.isFlashbots, "sealhash", sealHash, "parentHash", prevParentHash)
 			if w.skipSealHook != nil && w.skipSealHook(task) {
 				continue
 			}
@@ -689,8 +694,9 @@ func (w *worker) generateEnv(parent *types.Block, header *types.Header) (*enviro
 	if err != nil {
 		return nil, err
 	}
+
 	env := &environment{
-		signer:    types.NewEIP155Signer(w.chainConfig.ChainID),
+		signer:    types.MakeSigner(w.chainConfig, header.Number),
 		state:     state,
 		ancestors: mapset.NewSet(),
 		family:    mapset.NewSet(),
@@ -698,7 +704,6 @@ func (w *worker) generateEnv(parent *types.Block, header *types.Header) (*enviro
 		header:    header,
 		profit:    new(big.Int),
 	}
-
 	// when 08 is processed ancestors contain 07 (quick block)
 	for _, ancestor := range w.chain.GetBlocksFromHash(parent.Hash(), 7) {
 		for _, uncle := range ancestor.Uncles() {
@@ -707,7 +712,6 @@ func (w *worker) generateEnv(parent *types.Block, header *types.Header) (*enviro
 		env.family.Add(ancestor.Hash())
 		env.ancestors.Add(ancestor.Hash())
 	}
-
 	// Keep track of transactions which return errors so they can be removed
 	env.tcount = 0
 	env.gasPool = new(core.GasPool).AddGas(header.GasLimit)
@@ -717,8 +721,15 @@ func (w *worker) generateEnv(parent *types.Block, header *types.Header) (*enviro
 // makeCurrent creates a new environment for the current cycle.
 func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 	env, err := w.generateEnv(parent, header)
+	env.state.StartPrefetcher("miner")
 	if err != nil {
 		return err
+	}
+
+	// Swap out the old work with the new one, terminating any leftover prefetcher
+	// processes in the mean time and starting a new one.
+	if w.current != nil && w.current.state != nil {
+		w.current.state.StopPrefetcher()
 	}
 	w.current = env
 	return nil
@@ -771,9 +782,8 @@ func (w *worker) updateSnapshot() {
 		w.current.txs,
 		uncles,
 		w.current.receipts,
-		new(trie.Trie),
+		trie.NewStackTrie(nil),
 	)
-
 	w.snapshotState = w.current.state.Copy()
 }
 
@@ -985,6 +995,11 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 			w.current.tcount++
 			txs.Shift()
 
+		case errors.Is(err, core.ErrTxTypeNotSupported):
+			// Pop the unsupported transaction without shifting in the next from the account
+			log.Trace("Skipping unsupported transaction type", "sender", from, "type", tx.Type())
+			txs.Pop()
+
 		default:
 			// Strange error, discard the transaction and get the next in line (note, the
 			// nonce-too-high clause will prevent us from executing in vain).
@@ -1026,13 +1041,6 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 	if parent.Time() >= uint64(timestamp) {
 		timestamp = int64(parent.Time() + 1)
 	}
-	// this will ensure we're not going off too far in the future
-	if now := time.Now().Unix(); timestamp > now+1 {
-		wait := time.Duration(timestamp-now) * time.Second
-		log.Info("Mining too far in the future", "wait", common.PrettyDuration(wait))
-		time.Sleep(wait)
-	}
-
 	num := parent.Number()
 	header := &types.Header{
 		ParentHash: parent.Hash(),
@@ -1205,7 +1213,7 @@ func (w *worker) findMostProfitableBundle(bundles []types.Transactions, coinbase
 		totalEth, totalGasUsed, err := w.computeBundleGas(bundle, parent, header)
 
 		if err != nil {
-			log.Warn("Error computing gas for a bundle", "error", err)
+			log.Debug("Error computing gas for a bundle", "error", err)
 			continue
 		}
 
@@ -1231,6 +1239,7 @@ func (w *worker) computeBundleGas(bundle types.Transactions, parent *types.Block
 
 	var totalGasUsed uint64 = 0
 	var tempGasUsed uint64
+	gasFees := new(big.Int)
 
 	coinbaseBalanceBefore := env.state.GetBalance(w.coinbase)
 
@@ -1239,14 +1248,17 @@ func (w *worker) computeBundleGas(bundle types.Transactions, parent *types.Block
 		if err != nil {
 			return nil, 0, err
 		}
+		if receipt.Status == types.ReceiptStatusFailed {
+			return nil, 0, errors.New("revert")
+		}
+
 		totalGasUsed += receipt.GasUsed
+		gasFees.Add(gasFees, new(big.Int).Mul(big.NewInt(int64(totalGasUsed)), tx.GasPrice()))
 	}
 	coinbaseBalanceAfter := env.state.GetBalance(w.coinbase)
-	coinbaseDiff := new(big.Int).Sub(coinbaseBalanceAfter, coinbaseBalanceBefore)
-	totalEth := new(big.Int)
-	totalEth.Add(totalEth, coinbaseDiff)
+	coinbaseDiff := new(big.Int).Sub(new(big.Int).Sub(coinbaseBalanceAfter, gasFees), coinbaseBalanceBefore)
 
-	return totalEth, totalGasUsed, nil
+	return coinbaseDiff, totalGasUsed, nil
 }
 
 // copyReceipts makes a deep copy of the given receipts.
