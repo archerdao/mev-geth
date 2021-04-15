@@ -1218,7 +1218,7 @@ func (w *worker) findMostProfitableBundle(bundles []types.Transactions, coinbase
 		}
 
 		mevGasPrice := new(big.Int).Div(totalEth, new(big.Int).SetUint64(totalGasUsed))
-		if mevGasPrice.Cmp(maxBundlePrice) > 0 {
+		if totalEth.Cmp(maxTotalEth) > 0 {
 			maxBundle = bundle
 			maxBundlePrice = mevGasPrice
 			maxTotalEth = totalEth
